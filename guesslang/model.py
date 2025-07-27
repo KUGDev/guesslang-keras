@@ -81,10 +81,10 @@ def build(labels: List[str]) -> Tuple[Model, TextVectorization, TextVectorizatio
 
     input_layer = tf.keras.Input(shape=(1,), dtype=tf.string, name="content")
 
-    # === Wide part (multi-hot hashed) ===
+    # === Wide part (one-hot hashed) ===
     vectorizer_wide = tf.keras.layers.TextVectorization(
         max_tokens=HyperParameter.VOCABULARY_SIZE,
-        output_mode="multi_hot"
+        output_mode="one_hot"
     )
     wide_x = vectorizer_wide(input_layer)
 
@@ -98,7 +98,7 @@ def build(labels: List[str]) -> Tuple[Model, TextVectorization, TextVectorizatio
     deep_x = vectorizer_deep(input_layer)
     deep_x = tf.keras.layers.Embedding(input_dim=HyperParameter.VOCABULARY_SIZE,
                                        output_dim=HyperParameter.EMBEDDING_SIZE)(deep_x)
-    deep_x = tf.keras.layers.GlobalAveragePooling1D()(deep_x)
+    deep_x = tf.keras.layers.GlobalAveragePooling1D()(deep_x) # Model could be improved here?
     deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[0], activation="relu")(deep_x)
     deep_x = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_x)
     deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[1], activation="relu")(deep_x)
@@ -147,7 +147,7 @@ def train(
     train_dataset = _build_input_fn(data_root_dir, label_lookup, ModeKeys.TRAIN)
 
     built_model.compile(
-        optimizer=tf.keras.optimizers.Adam(HyperParameter.LEARNING_RATE),
+        optimizer=tf.keras.optimizers.Adagrad(HyperParameter.LEARNING_RATE),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
