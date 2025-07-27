@@ -9,6 +9,9 @@ from tempfile import TemporaryDirectory
 from typing import List, Tuple, Dict, Any, Callable
 
 import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import TextVectorization
+from tensorflow.lookup import StaticHashTable, KeyValueTensorInitializer
 from tensorflow.estimator import ModeKeys, Estimator
 from tensorflow.python.training.tracking.tracking import AutoTrackable
 
@@ -31,6 +34,8 @@ class HyperParameter:
     DNN_HIDDEN_UNITS = [512, 32]
     DNN_DROPOUT = 0.5
     N_GRAM = 2
+    LEARNING_RATE = 0.001
+    STEPS_PER_EPOCH = 100
 
 
 class Training:
@@ -47,54 +52,131 @@ def load(saved_model_dir: str) -> AutoTrackable:
     return tf.saved_model.load(saved_model_dir)
 
 
-def build(model_dir: str, labels: List[str]) -> Estimator:
+def build(labels: List[str]) -> Tuple[Model, TextVectorization, TextVectorization, StaticHashTable]:
     """Build a Tensorflow text classifier """
-    config = tf.estimator.RunConfig(
-        model_dir=model_dir,
-        save_checkpoints_steps=Training.CHECKPOINT_STEPS,
-    )
-    categorical_column = tf.feature_column.categorical_column_with_hash_bucket(
-        key='content',
-        hash_bucket_size=HyperParameter.VOCABULARY_SIZE,
-    )
-    dense_column = tf.feature_column.embedding_column(
-        categorical_column=categorical_column,
-        dimension=HyperParameter.EMBEDDING_SIZE,
-    )
+    # config = tf.estimator.RunConfig(
+    #     model_dir=model_dir,
+    #     save_checkpoints_steps=Training.CHECKPOINT_STEPS,
+    # )
+    # categorical_column = tf.feature_column.categorical_column_with_hash_bucket(
+    #     key='content',
+    #     hash_bucket_size=HyperParameter.VOCABULARY_SIZE,
+    # )
+    # dense_column = tf.feature_column.embedding_column(
+    #     categorical_column=categorical_column,
+    #     dimension=HyperParameter.EMBEDDING_SIZE,
+    # )
+    #
+    # return tf.estimator.DNNLinearCombinedClassifier(
+    #     linear_feature_columns=[categorical_column],
+    #     dnn_feature_columns=[dense_column],
+    #     dnn_hidden_units=HyperParameter.DNN_HIDDEN_UNITS,
+    #     dnn_dropout=HyperParameter.DNN_DROPOUT,
+    #     label_vocabulary=labels,
+    #     n_classes=len(labels),
+    #     config=config,
+    # )
 
-    return tf.estimator.DNNLinearCombinedClassifier(
-        linear_feature_columns=[categorical_column],
-        dnn_feature_columns=[dense_column],
-        dnn_hidden_units=HyperParameter.DNN_HIDDEN_UNITS,
-        dnn_dropout=HyperParameter.DNN_DROPOUT,
-        label_vocabulary=labels,
-        n_classes=len(labels),
-        config=config,
+    # Keras approach
+
+    input_layer = tf.keras.Input(shape=(1,), dtype=tf.string, name="content")
+
+    # === Wide part (multi-hot hashed) ===
+    vectorizer_wide = tf.keras.layers.TextVectorization(
+        max_tokens=HyperParameter.VOCABULARY_SIZE,
+        output_mode="multi_hot"
     )
+    wide_x = vectorizer_wide(input_layer)
 
-
-def train(estimator: Estimator, data_root_dir: str, max_steps: int) -> Any:
-    """Train a Tensorflow estimator"""
-
-    train_spec = tf.estimator.TrainSpec(
-        input_fn=_build_input_fn(data_root_dir, ModeKeys.TRAIN),
-        max_steps=max_steps,
+    # === Deep part (embedding + DNN) ===
+    vectorizer_deep = tf.keras.layers.TextVectorization(
+        max_tokens=HyperParameter.VOCABULARY_SIZE,
+        output_mode="int",
+        output_sequence_length=HyperParameter.NB_TOKENS,
+        ngrams=HyperParameter.N_GRAM,
     )
+    deep_x = vectorizer_deep(input_layer)
+    deep_x = tf.keras.layers.Embedding(input_dim=HyperParameter.VOCABULARY_SIZE,
+                                       output_dim=HyperParameter.EMBEDDING_SIZE)(deep_x)
+    deep_x = tf.keras.layers.GlobalAveragePooling1D()(deep_x)
+    deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[0], activation="relu")(deep_x)
+    deep_x = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_x)
+    deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[1], activation="relu")(deep_x)
 
-    if max_steps > Training.LONG_TRAINING_STEPS:
-        throttle_secs = Training.LONG_DELAY
-    else:
-        throttle_secs = Training.SHORT_DELAY
+    x = tf.keras.layers.concatenate([wide_x, deep_x])
+    output = tf.keras.layers.Dense(len(labels), activation="softmax")(x)
 
-    eval_spec = tf.estimator.EvalSpec(
-        input_fn=_build_input_fn(data_root_dir, ModeKeys.EVAL),
-        start_delay_secs=Training.SHORT_DELAY,
-        throttle_secs=throttle_secs,
+    built_model = tf.keras.Model(inputs=input_layer, outputs=output)
+
+    label_lookup = StaticHashTable(
+        KeyValueTensorInitializer(
+            keys=tf.constant(labels),
+            values=tf.constant(list(range(len(labels))), dtype=tf.int64),
+        ),
+        default_value=-1,
     )
+    return built_model, vectorizer_wide, vectorizer_deep, label_lookup
+
+
+def train(
+    built_model: Model,
+    vectorizer_wide: TextVectorization,
+    vectorizer_deep: TextVectorization,
+    label_lookup: StaticHashTable,
+    data_root_dir: str,
+    max_steps: int,
+) -> Model:
+    """Train a Keras model"""
 
     LOGGER.debug('Train the model')
-    results = tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
-    training_metrics = results[0]
+
+    # === Adapt vectorizers ===
+
+    pattern = str(Path(data_root_dir).joinpath(DATASET[ModeKeys.TRAIN], '*'))
+    adapt_dataset = (tf.data.Dataset
+                     .list_files(pattern)
+                     .map(_read_file)
+                     .cache()
+                     .map(lambda content, _: content)
+                     .batch(32))
+    vectorizer_wide.adapt(adapt_dataset)
+    vectorizer_deep.adapt(adapt_dataset)
+
+    # === Compile the model ===
+
+    train_dataset = _build_input_fn(data_root_dir, label_lookup, ModeKeys.TRAIN)
+
+    built_model.compile(
+        optimizer=tf.keras.optimizers.Adam(HyperParameter.LEARNING_RATE),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    # === Train the model ===
+
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+        filepath='checkpoints/model.{epoch:02d}.h5',
+        save_weights_only=False,
+        save_best_only=False,
+        save_freq='epoch'
+    )
+
+    built_model.fit(
+        train_dataset,
+        epochs=max_steps,
+        steps_per_epoch=HyperParameter.STEPS_PER_EPOCH,
+        callbacks=[checkpoint_cb]
+    )
+
+    return built_model
+
+
+def evaluate(trained_model: Model, label_lookup: StaticHashTable, data_root_dir: str,) -> dict:
+    """Evaluate the trained Keras model"""
+
+    eval_dataset = _build_input_fn(data_root_dir, label_lookup, ModeKeys.EVAL)
+    training_metrics = trained_model.evaluate(eval_dataset, return_dict=True)
+
     return training_metrics
 
 
@@ -158,24 +240,29 @@ def predict(
 
 def _build_input_fn(
     data_root_dir: str,
+    label_lookup: StaticHashTable,
     mode: ModeKeys,
-) -> Callable[[], tf.data.Dataset]:
-    """Generate an input fonction for a Tensorflow model"""
+) -> tf.data.Dataset:
+    """Generate an input dataset for a Keras model"""
     pattern = str(Path(data_root_dir).joinpath(DATASET[mode], '*'))
 
-    def input_function() -> tf.data.Dataset:
-        dataset = tf.data.Dataset
-        dataset = dataset.list_files(pattern, shuffle=True).map(_read_file)
+    raw_dataset = (tf.data.Dataset.list_files(pattern)
+                   .map(_read_file, num_parallel_calls=tf.data.AUTOTUNE)
+                   .shuffle(Training.SHUFFLE_BUFFER)
+                   .cache()
+                   .repeat())
 
-        if mode == ModeKeys.PREDICT:
-            return dataset.batch(1)
+    if mode == ModeKeys.PREDICT:
+        return raw_dataset.batch(1)
 
-        if mode == ModeKeys.TRAIN:
-            dataset = dataset.shuffle(Training.SHUFFLE_BUFFER).repeat()
+    if mode == ModeKeys.TRAIN:
+        raw_dataset = raw_dataset.shuffle(Training.SHUFFLE_BUFFER).repeat()
 
-        return dataset.map(_preprocess).batch(HyperParameter.BATCH_SIZE)
+    def encode(data: tf.Tensor, label: tf.Tensor):
+        return {"content": data}, label_lookup.lookup(label)
 
-    return input_function
+    return raw_dataset.map(encode).batch(HyperParameter.BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
 
 
 def _serving_input_receiver_fn() -> tf.estimator.export.ServingInputReceiver:
@@ -208,7 +295,15 @@ def _preprocess(
 
 
 def _preprocess_text(data: tf.Tensor) -> tf.Tensor:
-    """Feature engineering"""
+    """
+    Feature engineering.
+    If NB_TOKENS=10000, N_GRAM=2 =>
+    Produces the Tensor with the next representation:
+      origin ~~ [b"H", b"e", b"l", b"l", b"o", b" ", b"w", b"o", b"r", b"l", b"d"]
+      data ~~ [b"H e", b"e l", b"l l", b"l o", b"o  ", b"  w", b"w o", b"o r", b"r l", b"l d", b"d  ", b"   ", ..., b"   "]
+    NB_TOKENS=10000 => 10000 tokens (n-grams) will be produced, or the data will be trimmed to 10000 tokens
+    if the content length produces too many n-grams
+    """
     padding = tf.constant(['']*HyperParameter.NB_TOKENS)
     data = tf.strings.bytes_split(data)
     data = tf.strings.ngrams(data, HyperParameter.N_GRAM)

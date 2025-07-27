@@ -7,8 +7,10 @@ from statistics import mean, stdev
 from tempfile import TemporaryDirectory
 from typing import List, Tuple, Optional
 
-from guesslang import model
+import tensorflow as tf
 
+from guesslang import model
+from guesslang.model import HyperParameter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -129,11 +131,15 @@ class Guess:
 
         LOGGER.debug('Run the training')
         extensions = list(self._extension_map)
-        with TemporaryDirectory() as model_logs_dir:
-            estimator = model.build(model_logs_dir, extensions)
-            metrics = model.train(estimator, source_files_dir, max_steps)
-            LOGGER.info(f'Training metrics: {metrics}')
-            model.save(estimator, self._saved_model_dir)
+        built_model, vectorizer_wide, vectorizer_deep, label_lookup = model.build(extensions)
+        trained_model = model.train(built_model, vectorizer_wide, vectorizer_deep, label_lookup, source_files_dir, max_steps)
+        metrics = model.evaluate(trained_model, label_lookup, source_files_dir)
+        trained_model.save(self._saved_model_dir)
+        with open("training_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=4)
+
+        exit(1)
+        # TODO: continue the training process after verification
 
         LOGGER.debug(f'Test newly trained model {self._saved_model_dir}')
         self._model = model.load(self._saved_model_dir)
