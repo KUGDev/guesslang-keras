@@ -100,7 +100,7 @@ class Guess:
 
         return model.predict(self._model, self._extension_map, source_code)
 
-    def train(self, source_files_dir: str, max_steps: int) -> float:
+    def train(self, source_files_dir: str, epochs: int) -> float:
         """Train guesslang to recognize programming languages.
 
         The machine learning model is trained from source code files.
@@ -131,12 +131,12 @@ class Guess:
 
         LOGGER.debug('Run the training')
         extensions = list(self._extension_map)
-        built_model, vectorizer_wide, vectorizer_deep, label_lookup = model.build(extensions)
-        trained_model = model.train(built_model, vectorizer_wide, vectorizer_deep, label_lookup, source_files_dir, max_steps)
-        metrics = model.evaluate(trained_model, label_lookup, source_files_dir)
+        built_model, label_lookup = model.build(extensions, source_files_dir)
+        trained_model, train_metrics = model.train(built_model, label_lookup, source_files_dir, epochs)
+        # metrics = model.evaluate(trained_model, label_lookup, source_files_dir)
         trained_model.save(self._saved_model_dir)
-        with open("training_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=4)
+        with open("train_metrics.json", "w") as f:
+            json.dump(train_metrics, f, indent=4)
 
         exit(1)
         # TODO: continue the training process after verification
