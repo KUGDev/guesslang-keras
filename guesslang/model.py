@@ -9,7 +9,9 @@ from tempfile import TemporaryDirectory
 from typing import List, Tuple, Dict, Any, Callable
 
 import tensorflow as tf
+from jinja2.optimizer import optimize
 from tensorflow.estimator import ModeKeys, Estimator
+from tensorflow.python.ops.lookup_ops import StaticHashTable, KeyValueTensorInitializer
 from tensorflow.python.training.tracking.tracking import AutoTrackable
 
 
@@ -47,7 +49,7 @@ def load(saved_model_dir: str) -> AutoTrackable:
     return tf.saved_model.load(saved_model_dir)
 
 
-def build(model_dir: str, labels: List[str]) -> Estimator:
+def build(model_dir: str, source_files_dir: str, labels: List[str]) -> Estimator:
     """Build a Tensorflow text classifier """
     config = tf.estimator.RunConfig(
         model_dir=model_dir,
@@ -61,6 +63,48 @@ def build(model_dir: str, labels: List[str]) -> Estimator:
         categorical_column=categorical_column,
         dimension=HyperParameter.EMBEDDING_SIZE,
     )
+
+    wide_and_deep_input = tf.keras.Input(shape=(10000,), dtype=tf.string, name='content')
+
+    indicator_column = tf.feature_column.indicator_column(categorical_column)
+    wide_output = tf.keras.layers.DenseFeatures([indicator_column])({'content': wide_and_deep_input})
+    wide_output = tf.keras.layers.Dense(len(labels), activation='softmax')(wide_output)
+
+    wide_model = tf.keras.Model(inputs=wide_and_deep_input, outputs=wide_output)
+
+    deep_output = tf.keras.layers.DenseFeatures([dense_column])({'content': wide_and_deep_input})
+    deep_output = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[0], activation='relu')(deep_output)
+    deep_output = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_output)
+    deep_output = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[1], activation='relu')(deep_output)
+    deep_output = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_output)
+    deep_output = tf.keras.layers.Dense(len(labels), activation='softmax')(deep_output)
+
+    deep_model = tf.keras.Model(inputs=wide_and_deep_input, outputs=deep_output)
+
+    wide_deep_model = tf.keras.experimental.WideDeepModel(wide_model, deep_model)
+
+    wide_optimizer = tf.keras.optimizers.Ftrl()
+    deep_optimizer = tf.keras.optimizers.Adagrad()
+
+    wide_deep_model.compile(
+        optimizer=[wide_optimizer, deep_optimizer],
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    label_lookup = StaticHashTable(
+        KeyValueTensorInitializer(
+            keys=tf.constant(labels),
+            values=tf.constant(list(range(len(labels))), dtype=tf.int64),
+        ),
+        default_value=-1,
+    )
+
+    train_ds = _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.TRAIN)()
+    eval_ds = _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.EVAL)()
+
+    wide_deep_model.fit(train_ds, epochs=10)
+    metrics = wide_deep_model.evaluate(eval_ds, return_dict=True)
 
     return tf.estimator.DNNLinearCombinedClassifier(
         linear_feature_columns=[categorical_column],
@@ -77,7 +121,7 @@ def train(estimator: Estimator, data_root_dir: str, max_steps: int) -> Any:
     """Train a Tensorflow estimator"""
 
     train_spec = tf.estimator.TrainSpec(
-        input_fn=_build_input_fn(data_root_dir, ModeKeys.TRAIN),
+        input_fn=_build_input_fn_old(data_root_dir, ModeKeys.TRAIN),
         max_steps=max_steps,
     )
 
@@ -87,7 +131,7 @@ def train(estimator: Estimator, data_root_dir: str, max_steps: int) -> Any:
         throttle_secs = Training.SHORT_DELAY
 
     eval_spec = tf.estimator.EvalSpec(
-        input_fn=_build_input_fn(data_root_dir, ModeKeys.EVAL),
+        input_fn=_build_input_fn_old(data_root_dir, ModeKeys.EVAL),
         start_delay_secs=Training.SHORT_DELAY,
         throttle_secs=throttle_secs,
     )
@@ -121,7 +165,7 @@ def test(
     matches = {language: deepcopy(values) for language in values}
 
     LOGGER.debug('Test the model')
-    input_function = _build_input_fn(data_root_dir, ModeKeys.PREDICT)
+    input_function = _build_input_fn_old(data_root_dir, ModeKeys.PREDICT)
     for test_item in input_function():
         content = test_item[0]
         label = test_item[1].numpy()[0].decode()
@@ -156,7 +200,7 @@ def predict(
     return scores
 
 
-def _build_input_fn(
+def _build_input_fn_old(
     data_root_dir: str,
     mode: ModeKeys,
 ) -> Callable[[], tf.data.Dataset]:
@@ -174,6 +218,32 @@ def _build_input_fn(
             dataset = dataset.shuffle(Training.SHUFFLE_BUFFER).repeat()
 
         return dataset.map(_preprocess).batch(HyperParameter.BATCH_SIZE)
+
+    return input_function
+
+
+def _build_input_fn_new(
+    data_root_dir: str,
+    label_lookup: StaticHashTable,
+    mode: ModeKeys,
+) -> Callable[[], tf.data.Dataset]:
+    """Generate an input fonction for a Tensorflow model"""
+    pattern = str(Path(data_root_dir).joinpath(DATASET[mode], '*'))
+
+    def input_function() -> tf.data.Dataset:
+        dataset = tf.data.Dataset
+        dataset = dataset.list_files(pattern, shuffle=True).map(_read_file)
+
+        if mode == ModeKeys.PREDICT:
+            return dataset.batch(1)
+
+        if mode == ModeKeys.TRAIN:
+            dataset = dataset.shuffle(Training.SHUFFLE_BUFFER) # .repeat()
+
+        def _perform_label_lookup(data: tf.Tensor, label: tf.Tensor):
+            return data, label_lookup.lookup(label)
+
+        return dataset.map(_preprocess).map(_perform_label_lookup).batch(HyperParameter.BATCH_SIZE)
 
     return input_function
 

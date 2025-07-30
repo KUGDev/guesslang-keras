@@ -130,7 +130,7 @@ class Guess:
         LOGGER.debug('Run the training')
         extensions = list(self._extension_map)
         with TemporaryDirectory() as model_logs_dir:
-            estimator = model.build(model_logs_dir, extensions)
+            estimator = model.build(model_logs_dir, source_files_dir, extensions)
             metrics = model.train(estimator, source_files_dir, max_steps)
             LOGGER.info(f'Training metrics: {metrics}')
             model.save(estimator, self._saved_model_dir)
