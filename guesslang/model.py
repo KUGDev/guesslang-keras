@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 from typing import List, Tuple, Dict, Any, Callable
+import numpy as np
 
 import tensorflow as tf
 from jinja2.optimizer import optimize
@@ -50,7 +51,7 @@ def load(saved_model_dir: str) -> AutoTrackable:
 
 
 def build(model_dir: str, source_files_dir: str, labels: List[str]) -> Estimator:
-    """Build a Tensorflow text classifier """
+    """Build a Keras text classifier """
     config = tf.estimator.RunConfig(
         model_dir=model_dir,
         save_checkpoints_steps=Training.CHECKPOINT_STEPS,
@@ -64,34 +65,6 @@ def build(model_dir: str, source_files_dir: str, labels: List[str]) -> Estimator
         dimension=HyperParameter.EMBEDDING_SIZE,
     )
 
-    wide_and_deep_input = tf.keras.Input(shape=(10000,), dtype=tf.string, name='content')
-
-    indicator_column = tf.feature_column.indicator_column(categorical_column)
-    wide_output = tf.keras.layers.DenseFeatures([indicator_column])({'content': wide_and_deep_input})
-    wide_output = tf.keras.layers.Dense(len(labels), activation='softmax')(wide_output)
-
-    wide_model = tf.keras.Model(inputs=wide_and_deep_input, outputs=wide_output)
-
-    deep_output = tf.keras.layers.DenseFeatures([dense_column])({'content': wide_and_deep_input})
-    deep_output = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[0], activation='relu')(deep_output)
-    deep_output = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_output)
-    deep_output = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[1], activation='relu')(deep_output)
-    deep_output = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_output)
-    deep_output = tf.keras.layers.Dense(len(labels), activation='softmax')(deep_output)
-
-    deep_model = tf.keras.Model(inputs=wide_and_deep_input, outputs=deep_output)
-
-    wide_deep_model = tf.keras.experimental.WideDeepModel(wide_model, deep_model)
-
-    wide_optimizer = tf.keras.optimizers.Ftrl()
-    deep_optimizer = tf.keras.optimizers.Adagrad()
-
-    wide_deep_model.compile(
-        optimizer=[wide_optimizer, deep_optimizer],
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-
     label_lookup = StaticHashTable(
         KeyValueTensorInitializer(
             keys=tf.constant(labels),
@@ -103,8 +76,65 @@ def build(model_dir: str, source_files_dir: str, labels: List[str]) -> Estimator
     train_ds = _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.TRAIN)()
     eval_ds = _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.EVAL)()
 
-    wide_deep_model.fit(train_ds, epochs=10)
-    metrics = wide_deep_model.evaluate(eval_ds, return_dict=True)
+    input_layer = tf.keras.Input(shape=(1,), dtype=tf.string, name='content')
+
+    wide_vectorize_layer = tf.keras.layers.TextVectorization(
+        max_tokens=HyperParameter.VOCABULARY_SIZE,
+        output_mode="multi_hot",
+        ngrams=HyperParameter.N_GRAM,
+    )
+    wide_vectorize_layer.adapt(train_ds.map(lambda x, y: x["content"]))
+    wide_vectorized_layer = wide_vectorize_layer(input_layer)
+    wide_x = tf.keras.layers.Normalization()(wide_vectorized_layer)
+
+    deep_vectorize_layer = tf.keras.layers.TextVectorization(
+        max_tokens=HyperParameter.VOCABULARY_SIZE,
+        output_mode="int",
+        output_sequence_length=HyperParameter.NB_TOKENS,
+    )
+    deep_vectorize_layer.adapt(train_ds.map(lambda x, y: x["content"]))
+    deep_vectorized_layer = deep_vectorize_layer(input_layer)
+
+    deep_x = tf.keras.layers.Embedding(input_dim=HyperParameter.VOCABULARY_SIZE, output_dim=HyperParameter.EMBEDDING_SIZE)(deep_vectorized_layer)
+    deep_x = tf.keras.layers.GlobalAveragePooling1D()(deep_x)
+    deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[0], activation="relu")(deep_x)
+    deep_x = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_x)
+    deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[1], activation="relu")(deep_x)
+    deep_x = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_x)
+
+    wide_deep_concat_layer = tf.keras.layers.concatenate([wide_x, deep_x])
+
+    wide_deep_output_layer = tf.keras.layers.Dense(len(labels), name='logits')(wide_deep_concat_layer)
+    wide_deep_model = tf.keras.Model(inputs=input_layer, outputs=wide_deep_output_layer)
+    wide_deep_model.compile(
+        optimizer=tf.keras.optimizers.Adam(clipnorm=1.0),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=['accuracy']
+    )
+
+    wide_deep_model.fit(train_ds, epochs=10, validation_data=eval_ds)
+
+    wide_deep_model.summary()
+
+    # correct_predictions = 0
+    # all_tries = 0
+    # for test_item in _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.PREDICT)():
+    #     content = test_item[0]
+    #     label = test_item[1].numpy()[0].decode()
+    #
+    #     result = wide_deep_model.predict(content)
+    #     probs = tf.nn.softmax(result).numpy()
+    #
+    #     predicted = labels[np.argmax(probs)]
+    #     actual = label
+    #
+    #     if predicted == actual:
+    #         correct_predictions += 1
+    #     all_tries += 1
+    #
+    # print(f"Predicted {correct_predictions}/{all_tries}")
+
+    exit(1)
 
     return tf.estimator.DNNLinearCombinedClassifier(
         linear_feature_columns=[categorical_column],
@@ -217,7 +247,10 @@ def _build_input_fn_old(
         if mode == ModeKeys.TRAIN:
             dataset = dataset.shuffle(Training.SHUFFLE_BUFFER).repeat()
 
-        return dataset.map(_preprocess).batch(HyperParameter.BATCH_SIZE)
+        def _remove_empty_ds(data: tf.Tensor, _):
+            return tf.greater(tf.strings.length(data), 0)
+
+        return dataset.filter(_remove_empty_ds).map(_preprocess).batch(HyperParameter.BATCH_SIZE)
 
     return input_function
 
@@ -230,9 +263,13 @@ def _build_input_fn_new(
     """Generate an input fonction for a Tensorflow model"""
     pattern = str(Path(data_root_dir).joinpath(DATASET[mode], '*'))
 
+    def _remove_empty_ds(data: tf.Tensor, _):
+        """Remove empty files + small portions of unpredictable data to eliminate the noise"""
+        return tf.greater(tf.strings.length(data), 30)
+
     def input_function() -> tf.data.Dataset:
         dataset = tf.data.Dataset
-        dataset = dataset.list_files(pattern, shuffle=True).map(_read_file)
+        dataset = dataset.list_files(pattern, shuffle=True).map(_read_file).filter(_remove_empty_ds)
 
         if mode == ModeKeys.PREDICT:
             return dataset.batch(1)
@@ -241,9 +278,9 @@ def _build_input_fn_new(
             dataset = dataset.shuffle(Training.SHUFFLE_BUFFER) # .repeat()
 
         def _perform_label_lookup(data: tf.Tensor, label: tf.Tensor):
-            return data, label_lookup.lookup(label)
+            return {'content':data}, label_lookup.lookup(label)
 
-        return dataset.map(_preprocess).map(_perform_label_lookup).batch(HyperParameter.BATCH_SIZE)
+        return dataset.map(_perform_label_lookup).batch(HyperParameter.BATCH_SIZE)
 
     return input_function
 
