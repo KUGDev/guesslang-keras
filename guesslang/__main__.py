@@ -50,8 +50,8 @@ def main() -> None:
     # Handle command line arguments
     parser = _build_argument_parser()
     args = parser.parse_args()
-    if args.train and (not args.model or not args.steps):
-        parser.error('--model and --steps are required when using --train')
+    if args.train and (not args.model or not args.epochs):
+        parser.error('--model and --epochs are required when using --train')
 
     # Setup loggers
     logging_level = logging.DEBUG if args.debug else logging.INFO
@@ -71,7 +71,7 @@ def main() -> None:
         elif args.train:
             # Train from source code files
             LOGGER.debug(f'Train model and save result to: {args.model}')
-            accuracy = guess.train(args.train, max_steps=args.steps)
+            accuracy = guess.train(args.train, training_epochs=args.epochs)
             print(f'Trained model accuracy is {accuracy:.2%}')
 
         else:
@@ -140,16 +140,16 @@ def _build_argument_parser() -> ArgumentParser:
             The source files should be split in 3 directories named:
             {', '.join(DATASET.values())}.
 
-            --model and --steps values should be provided when using --train
+            --model and --epochs values should be provided when using --train
         """
     )
     parser.add_argument(
-        '--steps',
-        metavar='TRAINING_STEPS',
+        '--epochs',
+        metavar='TRAINING_EPOCHS',
         type=int,
         help="""
-            number of steps training steps. The model accuracy
-            and the training time increase with the number of steps
+            number of training epochs. The model accuracy
+            and the training time increase with the number of epochs
         """,
     )
     parser.add_argument(

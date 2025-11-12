@@ -1,0 +1,14 @@
+{
+  "sequence_length": 512,
+  "tfidf_size": 10000,
+  "vocab_size": 10000,
+  "embedding_size": 100,
+  "dense_units": [
+    256,
+    128
+  ],
+  "dropout_rate": 0.2,
+  "n_gram": 2,
+  "output_classes": 54,
+  "model_version": "1.0"
+}

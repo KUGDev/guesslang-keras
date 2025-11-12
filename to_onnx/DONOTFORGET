@@ -1,0 +1,58 @@
+================================================================================
+ saving_lib.py
+================================================================================
+
+def _load_state(
+    ...
+    if hasattr(saveable, "load_assets") and assets_store:
+        if skip_mismatch or failed_saveables is not None:
+            try:
+                saveable.load_assets(assets_store.get(inner_path), weights_store.get(inner_path))
+            except Exception as e:
+                print(f"2 {e}")
+                failed_saveables.add(id(saveable))
+                error_msgs[id(saveable)] = saveable, e
+                failure = True
+        else:
+            saveable.load_assets(assets_store.get(inner_path))
+    ...
+
+
+================================================================================
+ text_vectorization.py
+================================================================================
+
+    ...
+    def load_assets(self, dir_path, store=None):
+        self._lookup_layer.load_assets(dir_path, store)
+    ...
+
+
+================================================================================
+ index_lookup.py
+================================================================================
+
+    ...
+    def load_own_variables(self, store):
+        if self.output_mode == "tf_idf" and "StringLookup" not in f"{type(self)}":
+            self.idf_weights.assign(store["idf_weights"])
+            self.idf_weights_const = self.idf_weights.value()
+    ...
+    def load_assets(self, dir_path, store=None):
+        if self.input_vocabulary is not None:
+            # Vocab saved in config.
+            # TODO: consider unifying both paths.
+            return
+        vocabulary_filepath = tf.io.gfile.join(dir_path, "vocabulary.txt")
+        # TODO: fix bug with include_special_tokens and set reload from file.
+        with open(vocabulary_filepath, "r") as f:
+            lines = f.read().split("\n")
+            if tf.as_dtype(self.vocabulary_dtype) == tf.string:
+                values = [str(line) for line in lines]
+            else:
+                values = [int(line) for line in lines]
+            if self.output_mode == "tf_idf":
+                self.set_vocabulary(values, idf_weights=store["idf_weights"])
+            else:
+                self.set_vocabulary(values)
+    ...

@@ -2,6 +2,8 @@
 
 ![Guesslang](docs/_static/images/guesslang-readme.png)
 
+This is a modified version of Guesslang model. It provides the Keras model training functions, as well as the model itself.
+
 Guesslang detects the programming language of a given source code:
 
 ```bash

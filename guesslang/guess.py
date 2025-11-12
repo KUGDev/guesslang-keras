@@ -4,10 +4,10 @@ import json
 import logging
 from pathlib import Path
 from statistics import mean, stdev
-from tempfile import TemporaryDirectory
 from typing import List, Tuple, Optional
 
 from guesslang import model
+from guesslang.model import build_label_lookup
 
 
 LOGGER = logging.getLogger(__name__)
@@ -98,7 +98,7 @@ class Guess:
 
         return model.predict(self._model, self._extension_map, source_code)
 
-    def train(self, source_files_dir: str, max_steps: int) -> float:
+    def train(self, source_files_dir: str, training_epochs: int) -> float:
         """Train guesslang to recognize programming languages.
 
         The machine learning model is trained from source code files.
@@ -108,6 +108,10 @@ class Guess:
         :raise GuesslangError: when the training cannot be run.
         :param source_files_dir: directory that contains
             the "train", "valid" and "test" datasets.
+        :param training_epochs: the number of epochs for the model
+            to be trained (the training process will finish earlier
+            if there is no validation values improvement for
+            the next 3 epochs)
         :return: training accuracy, a value between 0 and 1.
         """
 
@@ -129,16 +133,16 @@ class Guess:
 
         LOGGER.debug('Run the training')
         extensions = list(self._extension_map)
-        with TemporaryDirectory() as model_logs_dir:
-            estimator = model.build(model_logs_dir, extensions)
-            metrics = model.train(estimator, source_files_dir, max_steps)
-            LOGGER.info(f'Training metrics: {metrics}')
-            model.save(estimator, self._saved_model_dir)
+        label_lookup = build_label_lookup(extensions)
+        built_model = model.build(source_files_dir, label_lookup, len(extensions))
+        metrics = model.train(built_model, source_files_dir, training_epochs, label_lookup)
+        LOGGER.info(f'Training metrics: {metrics}')
+        model.save(built_model, extensions, self._saved_model_dir)
 
         LOGGER.debug(f'Test newly trained model {self._saved_model_dir}')
         self._model = model.load(self._saved_model_dir)
         matches = model.test(
-            self._model, source_files_dir, self._extension_map
+            self._model, label_lookup, extensions, self._extension_map, source_files_dir
         )
 
         report_file = Path(self._saved_model_dir).joinpath(TEST_REPORT_FILE)
