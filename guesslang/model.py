@@ -1,19 +1,21 @@
 """Machine learning model"""
-
+import json
 from copy import deepcopy
 import logging
 from operator import itemgetter
 from pathlib import Path
-import shutil
-from tempfile import TemporaryDirectory
 from typing import List, Tuple, Dict, Any, Callable
-import numpy as np
 
+import random
+import numpy as np
 import tensorflow as tf
-from jinja2.optimizer import optimize
-from tensorflow.estimator import ModeKeys, Estimator
+from tensorflow.keras import Model
 from tensorflow.python.ops.lookup_ops import StaticHashTable, KeyValueTensorInitializer
-from tensorflow.python.training.tracking.tracking import AutoTrackable
+
+class ModeKeys:
+    TRAIN = 'train'
+    EVAL = 'valid'
+    PREDICT = 'test'
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,45 +29,31 @@ DATASET = {
 
 class HyperParameter:
     """Model hyper parameters"""
-    BATCH_SIZE = 100
-    NB_TOKENS = 10000
-    VOCABULARY_SIZE = 5000
+    BATCH_SIZE = 32
+    NB_TOKENS = 512
+    VOCABULARY_SIZE = 10000
     EMBEDDING_SIZE = max(10, int(VOCABULARY_SIZE**0.5))
-    DNN_HIDDEN_UNITS = [512, 32]
-    DNN_DROPOUT = 0.5
+    DNN_HIDDEN_UNITS = [256, 128]
+    DNN_DROPOUT = 0.2
     N_GRAM = 2
 
 
 class Training:
     """Model training parameters"""
-    SHUFFLE_BUFFER = HyperParameter.BATCH_SIZE * 10
-    CHECKPOINT_STEPS = 1000
-    LONG_TRAINING_STEPS = 10 * CHECKPOINT_STEPS
-    SHORT_DELAY = 60
-    LONG_DELAY = 5 * SHORT_DELAY
+    SHUFFLE_BUFFER = 10000
 
 
-def load(saved_model_dir: str) -> AutoTrackable:
-    """Load a Tensorflow saved model"""
-    return tf.saved_model.load(saved_model_dir)
+def load(saved_model_dir: str) -> Model:
+    """Load a Keras model"""
+    return tf.keras.models.load_model(f"{saved_model_dir}model.keras")
 
 
-def build(model_dir: str, source_files_dir: str, labels: List[str]) -> Estimator:
-    """Build a Keras text classifier """
-    config = tf.estimator.RunConfig(
-        model_dir=model_dir,
-        save_checkpoints_steps=Training.CHECKPOINT_STEPS,
-    )
-    categorical_column = tf.feature_column.categorical_column_with_hash_bucket(
-        key='content',
-        hash_bucket_size=HyperParameter.VOCABULARY_SIZE,
-    )
-    dense_column = tf.feature_column.embedding_column(
-        categorical_column=categorical_column,
-        dimension=HyperParameter.EMBEDDING_SIZE,
-    )
-
-    label_lookup = StaticHashTable(
+def build_label_lookup(labels: List[str]) -> StaticHashTable:
+    """
+    Build the label lookup as a static hash table
+    :param labels: the labels to build the lookup for
+    """
+    return StaticHashTable(
         KeyValueTensorInitializer(
             keys=tf.constant(labels),
             values=tf.constant(list(range(len(labels))), dtype=tf.int64),
@@ -73,28 +61,47 @@ def build(model_dir: str, source_files_dir: str, labels: List[str]) -> Estimator
         default_value=-1,
     )
 
-    train_ds = _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.TRAIN)()
-    eval_ds = _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.EVAL)()
 
+def build(source_files_dir: str, label_lookup: StaticHashTable, labels_count: int) -> Model:
+    """Build a Keras model"""
+
+    LOGGER.debug('Building the input layer')
     input_layer = tf.keras.Input(shape=(1,), dtype=tf.string, name='content')
 
-    wide_vectorize_layer = tf.keras.layers.TextVectorization(
-        max_tokens=HyperParameter.VOCABULARY_SIZE,
-        output_mode="multi_hot",
-        ngrams=HyperParameter.N_GRAM,
-    )
-    wide_vectorize_layer.adapt(train_ds.map(lambda x, y: x["content"]))
-    wide_vectorized_layer = wide_vectorize_layer(input_layer)
-    wide_x = tf.keras.layers.Normalization()(wide_vectorized_layer)
-
-    deep_vectorize_layer = tf.keras.layers.TextVectorization(
+    LOGGER.debug('Building shared vectorization layer')
+    shared_vectorize_layer = tf.keras.layers.TextVectorization(
         max_tokens=HyperParameter.VOCABULARY_SIZE,
         output_mode="int",
         output_sequence_length=HyperParameter.NB_TOKENS,
     )
-    deep_vectorize_layer.adapt(train_ds.map(lambda x, y: x["content"]))
-    deep_vectorized_layer = deep_vectorize_layer(input_layer)
 
+    LOGGER.debug('Building TF-IDF vectorization layer')
+    tfidf_vectorize_layer = tf.keras.layers.TextVectorization(
+        max_tokens=HyperParameter.VOCABULARY_SIZE,
+        output_mode="tf_idf",
+        ngrams=HyperParameter.N_GRAM,
+    )
+
+    LOGGER.debug('Building adapt dataset with limit')
+    adapt_ds = build_input_dataset(source_files_dir, label_lookup, ModeKeys.TRAIN, 50000)
+    adapt_ds = adapt_ds.unbatch().map(lambda x, y: x["content"])
+
+    LOGGER.debug('Starting adapt shared layer')
+    shared_vectorize_layer.adapt(adapt_ds)
+
+    LOGGER.debug('Starting adapt TF-IDF layer')
+    tfidf_vectorize_layer.adapt(adapt_ds)
+
+    LOGGER.debug('Building deep vectorized layer')
+    deep_vectorized_layer = shared_vectorize_layer(input_layer)
+
+    LOGGER.debug('Building wide vectorized layer')
+    wide_vectorized_layer = tfidf_vectorize_layer(input_layer)
+
+    LOGGER.debug('Building wide layer')
+    wide_x = tf.keras.layers.LayerNormalization()(wide_vectorized_layer)
+
+    LOGGER.debug('Building deep layer')
     deep_x = tf.keras.layers.Embedding(input_dim=HyperParameter.VOCABULARY_SIZE, output_dim=HyperParameter.EMBEDDING_SIZE)(deep_vectorized_layer)
     deep_x = tf.keras.layers.GlobalAveragePooling1D()(deep_x)
     deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[0], activation="relu")(deep_x)
@@ -102,120 +109,189 @@ def build(model_dir: str, source_files_dir: str, labels: List[str]) -> Estimator
     deep_x = tf.keras.layers.Dense(HyperParameter.DNN_HIDDEN_UNITS[1], activation="relu")(deep_x)
     deep_x = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(deep_x)
 
+    LOGGER.debug('Concatenating wide and deep parts')
     wide_deep_concat_layer = tf.keras.layers.concatenate([wide_x, deep_x])
 
-    wide_deep_output_layer = tf.keras.layers.Dense(len(labels), name='logits')(wide_deep_concat_layer)
+    LOGGER.debug('Building output layer')
+    wide_deep_output_layer = tf.keras.layers.Dense(
+        labels_count,
+        name='logits',
+        kernel_initializer='glorot_uniform',
+        bias_initializer='zeros'
+    )(wide_deep_concat_layer)
+
+    LOGGER.debug('Building the wide deep model')
     wide_deep_model = tf.keras.Model(inputs=input_layer, outputs=wide_deep_output_layer)
+
+    LOGGER.debug('Compiling the model')
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        0.001,
+        decay_steps=1000,
+        decay_rate=0.9,
+        staircase=True
+    )
     wide_deep_model.compile(
-        optimizer=tf.keras.optimizers.Adam(clipnorm=1.0),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0),
         loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=['accuracy']
     )
 
-    wide_deep_model.fit(train_ds, epochs=10, validation_data=eval_ds)
+    LOGGER.debug('Model summary:')
+    wide_deep_model.summary(print_fn=lambda x: LOGGER.debug(x))
 
-    wide_deep_model.summary()
+    return wide_deep_model
 
-    # correct_predictions = 0
-    # all_tries = 0
-    # for test_item in _build_input_fn_new(source_files_dir, label_lookup, ModeKeys.PREDICT)():
-    #     content = test_item[0]
-    #     label = test_item[1].numpy()[0].decode()
-    #
-    #     result = wide_deep_model.predict(content)
-    #     probs = tf.nn.softmax(result).numpy()
-    #
-    #     predicted = labels[np.argmax(probs)]
-    #     actual = label
-    #
-    #     if predicted == actual:
-    #         correct_predictions += 1
-    #     all_tries += 1
-    #
-    # print(f"Predicted {correct_predictions}/{all_tries}")
 
-    exit(1)
+def train(built_model: Model, source_files_dir: str, max_steps: int, label_lookup: StaticHashTable) -> Any:
+    """Train a Keras model"""
 
-    return tf.estimator.DNNLinearCombinedClassifier(
-        linear_feature_columns=[categorical_column],
-        dnn_feature_columns=[dense_column],
-        dnn_hidden_units=HyperParameter.DNN_HIDDEN_UNITS,
-        dnn_dropout=HyperParameter.DNN_DROPOUT,
-        label_vocabulary=labels,
-        n_classes=len(labels),
-        config=config,
+    LOGGER.debug('Building TRAIN data set')
+    train_ds = build_input_dataset(source_files_dir, label_lookup, ModeKeys.TRAIN)
+
+    LOGGER.debug('Checking first batch...')
+    for batch_x, batch_y in train_ds.take(1):
+        LOGGER.debug(f'Batch X shape: {batch_x}')
+        LOGGER.debug(f'Batch Y shape: {batch_y.shape}')
+        LOGGER.debug(f'Batch Y min/max: {tf.reduce_min(batch_y)}/{tf.reduce_max(batch_y)}')
+        LOGGER.debug(f'Batch Y unique values: {len(tf.unique(batch_y)[0])}')
+
+        # Predictions check
+        pred = built_model(batch_x, training=False)
+        LOGGER.debug(f'Prediction shape: {pred.shape}')
+        LOGGER.debug(f'Prediction min/max: {tf.reduce_min(pred)}/{tf.reduce_max(pred)}')
+
+    LOGGER.debug('Building EVAL data set')
+    eval_ds = build_input_dataset(source_files_dir, label_lookup, ModeKeys.EVAL)
+
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(
+        log_dir='./logs',
+        histogram_freq=1,
+        profile_batch='500,520' # profile batches from 500 to 520
     )
 
+    LOGGER.debug('Training the model')
+    class MemoryCleanupCallback(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            import gc
+            gc.collect()
+            tf.keras.backend.clear_session()
 
-def train(estimator: Estimator, data_root_dir: str, max_steps: int) -> Any:
-    """Train a Tensorflow estimator"""
+            import psutil
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            print(f"\nMemory after epoch {epoch + 1}: {mem_info.rss / 1024 / 1024:.2f} MB")
 
-    train_spec = tf.estimator.TrainSpec(
-        input_fn=_build_input_fn_old(data_root_dir, ModeKeys.TRAIN),
-        max_steps=max_steps,
+    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath='./custom_model/checkpoint/model_epoch_{epoch:02d}.keras',
+        save_freq='epoch',
+        save_best_only=False,
+        verbose=1
+    )
+    early_stopping_callback = tf.keras.callbacks.EarlyStopping(
+        monitor='val_accuracy',
+        patience=3,
+        restore_best_weights=True
     )
 
-    if max_steps > Training.LONG_TRAINING_STEPS:
-        throttle_secs = Training.LONG_DELAY
+    summary = built_model.fit(
+        train_ds,
+        epochs=max_steps,
+        validation_data=eval_ds,
+        callbacks=[
+            tensorboard_callback,
+            early_stopping_callback,
+            MemoryCleanupCallback(),
+            checkpoint_callback
+        ]
+    )
+
+    LOGGER.debug('Building and saving training metrics')
+    if summary.history:
+        training_metrics = {
+            'accuracy': summary.history['accuracy'][-1],
+            'loss': summary.history['loss'][-1]
+        }
+
+        if 'val_accuracy' in summary.history:
+            training_metrics['val_accuracy'] = summary.history['val_accuracy'][-1]
+
+        if 'val_loss' in summary.history:
+            training_metrics['val_loss'] = summary.history['val_loss'][-1]
+
+        return training_metrics
     else:
-        throttle_secs = Training.SHORT_DELAY
-
-    eval_spec = tf.estimator.EvalSpec(
-        input_fn=_build_input_fn_old(data_root_dir, ModeKeys.EVAL),
-        start_delay_secs=Training.SHORT_DELAY,
-        throttle_secs=throttle_secs,
-    )
-
-    LOGGER.debug('Train the model')
-    results = tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
-    training_metrics = results[0]
-    return training_metrics
+        return {}
 
 
-def save(estimator: Estimator, saved_model_dir: str) -> None:
-    """Save a Tensorflow estimator"""
-    with TemporaryDirectory() as temporary_model_base_dir:
-        export_dir = estimator.export_saved_model(
-            temporary_model_base_dir, _serving_input_receiver_fn
-        )
+def save(trained_model: Model, labels: list[str], saved_model_dir: str) -> None:
+    """Save and export the model in Keras, Saved Model, and ONNX formats. Save labels as well"""
+    saved_model_path = Path(saved_model_dir)
+    saved_model_path.mkdir(parents=True, exist_ok=True)
 
-        Path(saved_model_dir).mkdir(exist_ok=True)
-        export_path = Path(export_dir.decode()).absolute()
-        for path in export_path.glob('*'):
-            shutil.move(str(path), saved_model_dir)
+    keras_model_file = saved_model_path / 'model.keras'
+    LOGGER.debug(f'Saving Keras model to {keras_model_file}')
+    trained_model.save(keras_model_file)
+
+    savedmodel_dir = saved_model_path / 'saved_model'
+    LOGGER.debug(f'Exporting SavedModel to {savedmodel_dir}')
+    trained_model.export(savedmodel_dir)
+
+    onnx_file = saved_model_path / 'model.onnx'
+    LOGGER.debug(f'Exporting ONNX model to {onnx_file}')
+    try:
+        trained_model.export(onnx_file, format="onnx")
+    except Exception as e:
+        LOGGER.warning(f'ONNX export failed: {e}')
+
+    labels_file = saved_model_path / 'labels.json'
+    LOGGER.debug(f'Saving labels to {labels_file}')
+    with open(labels_file, 'w') as f:
+        json.dump(labels, f, indent=2)
+
+    LOGGER.info(f'Model saved successfully to {saved_model_dir}')
 
 
 def test(
-    saved_model: AutoTrackable,
+    trained_model: Model,
+    label_lookup: StaticHashTable,
+    labels: list[str],
+    mapping: dict[str, str],
     data_root_dir: str,
-    mapping: Dict[str, str],
 ) -> Dict[str, Dict[str, int]]:
-    """Test a Tensorflow saved model"""
+    """Test a Keras model"""
     values = {language: 0 for language in mapping.values()}
     matches = {language: deepcopy(values) for language in values}
 
+    test_dataset = build_input_dataset(data_root_dir, label_lookup, ModeKeys.PREDICT)
+
     LOGGER.debug('Test the model')
-    input_function = _build_input_fn_old(data_root_dir, ModeKeys.PREDICT)
-    for test_item in input_function():
-        content = test_item[0]
-        label = test_item[1].numpy()[0].decode()
+    for batch in test_dataset:
+        content_batch, label_batch = batch
 
-        result = saved_model.signatures['predict'](content)
-        predicted = result['classes'].numpy()[0][0].decode()
+        # Get predictions
+        predictions = trained_model.predict(content_batch, verbose=0)
+        predicted_idx = np.argmax(predictions[0])
+        predicted_label = labels[predicted_idx]
 
-        label_language = mapping[label]
-        predicted_language = mapping[predicted]
+        # Get true label
+        true_idx = int(label_batch.numpy()[0])
+        true_label = labels[true_idx]
+
+        # Map to languages
+        label_language = mapping[true_label]
+        predicted_language = mapping[predicted_label]
         matches[label_language][predicted_language] += 1
 
     return matches
 
 
 def predict(
-    saved_model: AutoTrackable,
+    saved_model,
     mapping: Dict[str, str],
     text: str
 ) -> List[Tuple[str, float]]:
     """Infer a Tensorflow saved model"""
+    raise Exception("This functionality needs to be reworked")
     content_tensor = tf.constant([text])
     predicted = saved_model.signatures['serving_default'](content_tensor)
 
@@ -230,95 +306,69 @@ def predict(
     return scores
 
 
-def _build_input_fn_old(
-    data_root_dir: str,
-    mode: ModeKeys,
-) -> Callable[[], tf.data.Dataset]:
-    """Generate an input fonction for a Tensorflow model"""
-    pattern = str(Path(data_root_dir).joinpath(DATASET[mode], '*'))
-
-    def input_function() -> tf.data.Dataset:
-        dataset = tf.data.Dataset
-        dataset = dataset.list_files(pattern, shuffle=True).map(_read_file)
-
-        if mode == ModeKeys.PREDICT:
-            return dataset.batch(1)
-
-        if mode == ModeKeys.TRAIN:
-            dataset = dataset.shuffle(Training.SHUFFLE_BUFFER).repeat()
-
-        def _remove_empty_ds(data: tf.Tensor, _):
-            return tf.greater(tf.strings.length(data), 0)
-
-        return dataset.filter(_remove_empty_ds).map(_preprocess).batch(HyperParameter.BATCH_SIZE)
-
-    return input_function
-
-
-def _build_input_fn_new(
+def build_input_dataset(
     data_root_dir: str,
     label_lookup: StaticHashTable,
     mode: ModeKeys,
-) -> Callable[[], tf.data.Dataset]:
-    """Generate an input fonction for a Tensorflow model"""
+    samples_limit: int = None
+) -> tf.data.Dataset:
+    """Generate an input data set for a Keras model"""
     pattern = str(Path(data_root_dir).joinpath(DATASET[mode], '*'))
+    file_paths = tf.io.gfile.glob(pattern)
 
-    def _remove_empty_ds(data: tf.Tensor, _):
-        """Remove empty files + small portions of unpredictable data to eliminate the noise"""
-        return tf.greater(tf.strings.length(data), 30)
-
-    def input_function() -> tf.data.Dataset:
-        dataset = tf.data.Dataset
-        dataset = dataset.list_files(pattern, shuffle=True).map(_read_file).filter(_remove_empty_ds)
-
-        if mode == ModeKeys.PREDICT:
-            return dataset.batch(1)
-
+    def _data_generator():
+        """Produce the next content dictionary, gathered from a file"""
         if mode == ModeKeys.TRAIN:
-            dataset = dataset.shuffle(Training.SHUFFLE_BUFFER) # .repeat()
+            random.shuffle(file_paths)
 
-        def _perform_label_lookup(data: tf.Tensor, label: tf.Tensor):
-            return {'content':data}, label_lookup.lookup(label)
+        samples_yielded = 0
 
-        return dataset.map(_perform_label_lookup).batch(HyperParameter.BATCH_SIZE)
+        for file_path in file_paths:
+            if samples_limit and samples_yielded >= samples_limit:
+                break
 
-    return input_function
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
 
+                # Remove empty files + small portions of unpredictable data to eliminate the noise
+                if len(content) <= 30:
+                    continue
 
-def _serving_input_receiver_fn() -> tf.estimator.export.ServingInputReceiver:
-    """Function to serve model for predictions."""
+                label = file_path.split('.')[-1]
 
-    content = tf.compat.v1.placeholder(tf.string, [None])
-    receiver_tensors = {'content': content}
-    features = {'content': tf.map_fn(_preprocess_text, content)}
+                yield {'content': content}, label
+                samples_yielded += 1
 
-    return tf.estimator.export.ServingInputReceiver(
-        receiver_tensors=receiver_tensors,
-        features=features,
+                del content
+
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+                continue
+
+    output_signature = (
+        {'content': tf.TensorSpec(shape=(), dtype=tf.string)},
+        tf.TensorSpec(shape=(), dtype=tf.string)
     )
 
+    dataset = tf.data.Dataset.from_generator(
+        _data_generator,
+        output_signature=output_signature
+    )
 
-def _read_file(filename: str) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Read a source file, return the content and the extension"""
-    data = tf.io.read_file(filename)
-    label = tf.strings.split([filename], '.').values[-1]
-    return data, label
+    # Perform label lookup build to tensor, return 'content' to data dict and the labels tensor
+    dataset = dataset.map(
+        lambda data, label: (data, label_lookup.lookup(label)),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    dataset = dataset.filter(lambda data, label_id: label_id >= 0)
 
+    if mode == ModeKeys.PREDICT:
+        return dataset.batch(1).prefetch(tf.data.AUTOTUNE)
 
-def _preprocess(
-    data: tf.Tensor,
-    label: tf.Tensor,
-) -> Tuple[Dict[str, tf.Tensor], tf.Tensor]:
-    """Process input data as part of a workflow"""
-    data = _preprocess_text(data)
-    return {'content': data}, label
+    if mode == ModeKeys.TRAIN:
+        dataset = dataset.shuffle(Training.SHUFFLE_BUFFER)
 
-
-def _preprocess_text(data: tf.Tensor) -> tf.Tensor:
-    """Feature engineering"""
-    padding = tf.constant(['']*HyperParameter.NB_TOKENS)
-    data = tf.strings.bytes_split(data)
-    data = tf.strings.ngrams(data, HyperParameter.N_GRAM)
-    data = tf.concat((data, padding), axis=0)
-    data = data[:HyperParameter.NB_TOKENS]
-    return data
+    dataset = dataset.batch(HyperParameter.BATCH_SIZE)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    return dataset
